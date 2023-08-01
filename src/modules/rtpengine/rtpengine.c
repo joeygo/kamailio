@@ -53,6 +53,7 @@
 #include "../../core/data_lump.h"
 #include "../../core/data_lump_rpl.h"
 #include "../../core/error.h"
+#include "../../core/fmsg.h"
 #include "../../core/forward.h"
 #include "../../core/mem/mem.h"
 #include "../../core/parser/parse_from.h"
@@ -108,6 +109,8 @@ MODULE_VERSION
 #define HOSTNAME_SIZE				100
 
 #define DEFAULT_RTPP_SET_ID			0
+
+#define RTPENGINE_DTMF_EVENT_BUFFER	32768
 
 enum {
 	RPC_FOUND_ALL = 2,
@@ -236,6 +239,7 @@ static char *send_rtpp_command(struct rtpp_node *, bencode_item_t *, int *);
 static int get_extra_id(struct sip_msg* msg, str *id_str);
 
 static int rtpengine_set_store(modparam_t type, void * val);
+static int rtpengine_set_dtmf_events_sock(modparam_t type, void * val);
 static int rtpengine_add_rtpengine_set(char * rtp_proxies, unsigned int weight, int disabled, unsigned int ticks);
 
 static int mod_init(void);
@@ -248,6 +252,9 @@ static int bind_force_send_ip(int sock_idx);
 
 static int add_rtpp_node_info(void *ptrs, struct rtpp_node *crt_rtpp, struct rtpp_set *rtpp_list);
 static int rtpp_test_ping(struct rtpp_node *node);
+
+static void rtpengine_dtmf_events_loop(int rank);
+static int rtpengine_raise_dtmf_event(char* buffer, int len);
 
 /* Pseudo-Variables */
 static int pv_get_rtpestat_f(struct sip_msg *, pv_param_t *, pv_value_t *);
@@ -301,6 +308,18 @@ static pv_spec_t *read_sdp_pvar = NULL;
 static str media_duration_pvar_str = {NULL, 0};
 static pv_spec_t *media_duration_pvar = NULL;
 
+static str dtmf_event_callid_pvar_str = {NULL, 0};
+static pv_spec_t *dtmf_event_callid_pvar = NULL;
+
+static str dtmf_event_source_tag_pvar_str = {NULL, 0};
+static pv_spec_t *dtmf_event_source_tag_pvar = NULL;
+
+static str dtmf_event_timestamp_pvar_str = {NULL, 0};
+static pv_spec_t *dtmf_event_timestamp_pvar = NULL;
+
+static str dtmf_event_pvar_str = {NULL, 0};
+static pv_spec_t *dtmf_event_pvar = NULL;
+
 #define RTPENGINE_SESS_LIMIT_MSG "Parallel session limit reached"
 #define RTPENGINE_SESS_LIMIT_MSG_LEN (sizeof(RTPENGINE_SESS_LIMIT_MSG)-1)
 
@@ -314,6 +333,10 @@ static str _rtpe_wsapi = STR_NULL;
 lwsc_api_t _rtpe_lwscb = {0};
 
 static enum hash_algo_t hash_algo = RTP_HASH_CALLID;
+
+static str rtpengine_dtmf_event_sock;
+static int rtpengine_dtmf_event_fd;
+int dtmf_event_rt = -1; /* default disabled */
 
 typedef struct rtpp_set_link {
 	struct rtpp_set *rset;
@@ -489,6 +512,11 @@ static param_export_t params[] = {
 	{"setid_default",         INT_PARAM, &setid_default          },
 	{"media_duration",        PARAM_STR, &media_duration_pvar_str},
 	{"hash_algo",             INT_PARAM, &hash_algo},
+	{"dtmf_events_sock",      STR_PARAM|USE_FUNC_PARAM, (void *)rtpengine_set_dtmf_events_sock},
+	{"dtmf_event_callid",     PARAM_STR, &dtmf_event_callid_pvar_str   },
+	{"dtmf_event_source_tag", PARAM_STR, &dtmf_event_source_tag_pvar_str   },
+	{"dtmf_event_timestamp",  PARAM_STR, &dtmf_event_timestamp_pvar_str   },
+	{"dtmf_event",    	  	  PARAM_STR, &dtmf_event_pvar_str   },
 
 	/* MOS stats output */
 	/* global averages */
@@ -509,7 +537,7 @@ static param_export_t params[] = {
 	{"mos_average_jitter_pv",     PARAM_STR, &global_mos_stats.average.jitter_param      },
 	{"mos_average_roundtrip_pv",  PARAM_STR, &global_mos_stats.average.roundtrip_param   },
 	{"mos_average_roundtrip_leg_pv", PARAM_STR, &global_mos_stats.average.roundtrip_leg_param },
-	{"mos_average_samples_pv",    PARAM_STR, &global_mos_stats.average.samples_param     },
+	{"mos_average_samples_pv",    PARAM_STR, &global_mos_stats.average.samples_param     },	
 
 	/* designated side A */
 	{"mos_A_label_pv",              PARAM_STR, &side_A_mos_stats.label_param               },
@@ -1216,6 +1244,206 @@ error:
 	return -1;
 }
 
+static int rtpengine_set_dtmf_events_sock(modparam_t type, void * val)
+{
+	char * p;
+	p = (char* )val;
+
+	if(p==0 || *p=='\0'){
+		return 0;
+	}
+
+	rtpengine_dtmf_event_sock.s = p;
+	rtpengine_dtmf_event_sock.len = strlen(rtpengine_dtmf_event_sock.s);
+
+	return 0;
+}
+
+static void rtpengine_dtmf_events_loop(int rank)
+{
+	int ret;
+	char *p;
+	str s_port;
+	unsigned int port;
+	union sockaddr_union udp_addr;
+	char buffer[RTPENGINE_DTMF_EVENT_BUFFER];
+
+	p = q_memchr(rtpengine_dtmf_event_sock.s, ':', rtpengine_dtmf_event_sock.len);
+	if (!p) {
+		LM_ERR("failed to initialize dtmf event listener because no port was specified %.*s!\n", rtpengine_dtmf_event_sock.len, rtpengine_dtmf_event_sock.s);
+		return;
+	}
+
+	s_port.s = p + 1;
+	s_port.len = rtpengine_dtmf_event_sock.s + rtpengine_dtmf_event_sock.len - s_port.s;
+
+	if (s_port.len <= 0 || str2int(&s_port, &port) < 0 || port > 65535) {
+		LM_ERR("failed to initialize dtmf event listener because port is invalid %.*s\n", rtpengine_dtmf_event_sock.len, rtpengine_dtmf_event_sock.s);
+		return;
+	}
+	rtpengine_dtmf_event_sock.len -= s_port.len + 1;
+	trim(&rtpengine_dtmf_event_sock);
+	rtpengine_dtmf_event_sock.s[rtpengine_dtmf_event_sock.len] = '\0';
+
+	memset(&udp_addr, 0, sizeof(udp_addr));
+
+	if (rtpengine_dtmf_event_sock.s[0] == '[') {
+		udp_addr.sin6.sin6_family = AF_INET6;
+		udp_addr.sin6.sin6_port = htons(port);
+		ret = inet_pton(AF_INET, rtpengine_dtmf_event_sock.s, &udp_addr.sin6.sin6_addr);
+	} else {
+		udp_addr.sin.sin_family = AF_INET;
+		udp_addr.sin.sin_port = htons(port);
+		ret = inet_pton(AF_INET, rtpengine_dtmf_event_sock.s, &udp_addr.sin.sin_addr);
+	}			
+
+	if (ret != 1) {
+		LM_ERR("failed to initialize dtmf event listener because address could not be created for %s\n", rtpengine_dtmf_event_sock.s);
+		return;
+	}
+
+	rtpengine_dtmf_event_fd = socket(udp_addr.s.sa_family, SOCK_DGRAM, 0);
+
+	if(rtpengine_dtmf_event_fd < 0) {
+		LM_ERR("can't create socket\n");
+		return;
+	}
+	
+	if (bind(rtpengine_dtmf_event_fd, (struct sockaddr*)&udp_addr.s, sizeof(udp_addr.s)) < 0) {
+		LM_ERR("could not bind dtmf events socket %s:%u (%s:%d)\n", rtpengine_dtmf_event_sock.s, port, strerror(errno), errno);
+		goto end;
+	}
+	
+	LM_INFO("dtmf event listener started on %s:%u\n", rtpengine_dtmf_event_sock.s, port);
+	
+	for (;;) {		
+		do
+			ret = read(rtpengine_dtmf_event_fd, buffer, RTPENGINE_DTMF_EVENT_BUFFER);			
+		while (ret == -1 && errno == EINTR);
+
+		if (ret < 0) {
+			LM_ERR("problem reading on socket %s:%u (%s:%d)\n", rtpengine_dtmf_event_sock.s, port, strerror(errno), errno);
+			goto end;
+		}
+
+		if (dtmf_event_rt == -1) {
+			LM_NOTICE("nothing to do - nobody is listening!\n");
+			goto end;
+		}
+
+		p = shm_malloc(ret + 1);
+		if (!p) {
+			LM_ERR("could not allocate %d for buffer %.*s\n", ret, ret, buffer);
+			goto end;
+		}
+		memcpy(p, buffer, ret);
+		p[ret] = '\0';		
+
+		if (rtpengine_raise_dtmf_event(p, ret) < 0) {
+			LM_ERR("Failed to raise dtmf event\n");
+			shm_free(p);
+		}
+	}
+
+end:	
+	close(rtpengine_dtmf_event_fd);
+}
+
+static int rtpengine_raise_dtmf_event(char *buffer, int len) {
+	srjson_doc_t jdoc;
+	srjson_t *it = NULL;
+	struct sip_msg *fmsg = NULL;
+	struct run_act_ctx ctx;
+	int rtb;	
+
+	LM_DBG("executing event_route[rtpengine:dtmf-event] (%d)\n", dtmf_event_rt);
+	LM_DBG("dispatching buffer: %s\n", buffer);
+
+	srjson_InitDoc(&jdoc, NULL);
+
+	jdoc.buf.s = buffer;		
+	jdoc.buf.len = len;
+
+	jdoc.root = srjson_Parse(&jdoc, jdoc.buf.s);
+	if(jdoc.root == NULL) {
+		LM_ERR("invalid json doc [[%s]]\n", jdoc.buf.s);
+		return -1;
+	}
+
+	if(faked_msg_init()<0) {
+		LM_ERR("Failed to initialize fake msg\n");
+		return -1;
+	}		
+	
+	/* iterate over keys */
+	for(it = jdoc.root->child; it; it = it->next) {
+		LM_DBG("found field: %s\n", it->string);
+		if(strcmp(it->string, "callid") == 0) {
+			pv_value_t pv_val;
+			pv_val.rs.s = it->valuestring;
+			pv_val.rs.len = strlen(it->valuestring);
+			pv_val.flags = PV_VAL_STR;
+			
+			if (dtmf_event_callid_pvar->setf(0, &dtmf_event_callid_pvar->pvp, (int)EQ_T, &pv_val) < 0) {					
+				LM_ERR("error setting pvar <%.*s>\n", dtmf_event_callid_pvar_str.len, dtmf_event_callid_pvar_str.s);
+				return -1;
+			}				
+		} else if(strcmp(it->string, "source_tag") == 0) {
+			pv_value_t pv_val;
+			pv_val.rs.s = it->valuestring;
+			pv_val.rs.len = strlen(it->valuestring);
+			pv_val.flags = PV_VAL_STR;
+			
+			if (dtmf_event_source_tag_pvar->setf(0, &dtmf_event_source_tag_pvar->pvp, (int)EQ_T, &pv_val) < 0) {					
+				LM_ERR("error setting pvar <%.*s>\n", dtmf_event_source_tag_pvar_str.len, dtmf_event_source_tag_pvar_str.s);
+				return -1;
+			}
+		} else if(strcmp(it->string, "timestamp") == 0) {
+			pv_value_t pv_val;
+			int_str val = {0};
+			char intbuf[32];				
+			snprintf(intbuf, sizeof(intbuf), "%lli", SRJSON_GET_INT(it));
+			memset(&val, 0, sizeof(val));
+			
+			pv_val.rs.s = intbuf;
+			pv_val.rs.len = strlen(intbuf);
+			pv_val.flags = PV_VAL_STR;
+			
+			if (dtmf_event_timestamp_pvar->setf(0, &dtmf_event_timestamp_pvar->pvp, (int)EQ_T, &pv_val) < 0) {					
+				LM_ERR("error setting pvar <%.*s>\n", dtmf_event_timestamp_pvar_str.len, dtmf_event_timestamp_pvar_str.s);
+				return -1;
+			}
+		} else if(strcmp(it->string, "event") == 0) {
+			pv_value_t pv_val;
+			int_str val = {0};
+			char intbuf[32];				
+			snprintf(intbuf, sizeof(intbuf), "%lli", SRJSON_GET_INT(it));
+			memset(&val, 0, sizeof(val));
+			
+			pv_val.rs.s = intbuf;
+			pv_val.rs.len = strlen(intbuf);
+			pv_val.flags = PV_VAL_STR;
+			
+			if (dtmf_event_pvar->setf(0, &dtmf_event_pvar->pvp, (int)EQ_T, &pv_val) < 0) {					
+				LM_ERR("error setting pvar <%.*s>\n", dtmf_event_pvar_str.len, dtmf_event_pvar_str.s);
+				return -1;
+			}
+		} 
+	}
+	
+	fmsg = faked_msg_next();
+	rtb = get_route_type();
+	set_route_type(REQUEST_ROUTE);
+	init_run_actions_ctx(&ctx);
+	run_top_route(event_rt.rlist[dtmf_event_rt], fmsg, &ctx);		
+	set_route_type(rtb);
+	if(ctx.run_flags&DROP_R_F) {
+		LM_ERR("exit due to 'drop' in event route\n");
+		return -1;
+	}
+
+	return 0;
+}
 
 static int fixup_set_id(void ** param, int param_no)
 {
@@ -1783,6 +2011,46 @@ mod_init(void)
 		}
 	}
 
+	if (dtmf_event_callid_pvar_str.len > 0) {
+		dtmf_event_callid_pvar = pv_cache_get(&dtmf_event_callid_pvar_str);
+		if (dtmf_event_callid_pvar == NULL
+			|| (dtmf_event_callid_pvar->type != PVT_AVP && dtmf_event_callid_pvar->type != PVT_SCRIPTVAR) ) {
+			LM_ERR("dtmf_event_callid_pv: not a valid AVP or VAR definition <%.*s>\n",
+				dtmf_event_callid_pvar_str.len, dtmf_event_callid_pvar_str.s);
+			return -1;
+		}
+	}
+
+	if (dtmf_event_source_tag_pvar_str.len > 0) {
+		dtmf_event_source_tag_pvar = pv_cache_get(&dtmf_event_source_tag_pvar_str);
+		if (dtmf_event_source_tag_pvar == NULL
+			|| (dtmf_event_source_tag_pvar->type != PVT_AVP && dtmf_event_source_tag_pvar->type != PVT_SCRIPTVAR) ) {
+			LM_ERR("dtmf_event_source_tag_pv: not a valid AVP or VAR definition <%.*s>\n",
+				dtmf_event_source_tag_pvar_str.len, dtmf_event_source_tag_pvar_str.s);
+			return -1;
+		}
+	}
+
+	if (dtmf_event_timestamp_pvar_str.len > 0) {
+		dtmf_event_timestamp_pvar = pv_cache_get(&dtmf_event_timestamp_pvar_str);
+		if (dtmf_event_timestamp_pvar == NULL
+			|| (dtmf_event_timestamp_pvar->type != PVT_AVP && dtmf_event_timestamp_pvar->type != PVT_SCRIPTVAR) ) {
+			LM_ERR("dtmf_event_timestamp_pv: not a valid AVP or VAR definition <%.*s>\n",
+				dtmf_event_timestamp_pvar_str.len, dtmf_event_timestamp_pvar_str.s);
+			return -1;
+		}
+	}
+
+	if (dtmf_event_pvar_str.len > 0) {
+		dtmf_event_pvar = pv_cache_get(&dtmf_event_pvar_str);
+		if (dtmf_event_pvar == NULL
+			|| (dtmf_event_pvar->type != PVT_AVP && dtmf_event_pvar->type != PVT_SCRIPTVAR) ) {
+			LM_ERR("event_pv: not a valid AVP or VAR definition <%.*s>\n",
+				dtmf_event_pvar_str.len, dtmf_event_pvar_str.s);
+			return -1;
+		}
+	}
+
 	if (rtpp_strings)
 		pkg_free(rtpp_strings);
 
@@ -1828,6 +2096,10 @@ mod_init(void)
 			return -1;
 		}
 	}
+
+	dtmf_event_rt = route_lookup(&event_rt, "rtpengine:dtmf-event");
+	if (dtmf_event_rt >= 0 && event_rt.rlist[dtmf_event_rt] == 0)
+		dtmf_event_rt = -1; /* disable */
 
 	return 0;
 }
@@ -2104,6 +2376,9 @@ child_init(int rank)
 		/* probe rtpengines only in first worker */
 		if (build_rtpp_socks(0, 1))
 			return -1;
+			
+		if (rtpengine_dtmf_event_sock.len > 0)
+			rtpengine_dtmf_events_loop(rank);
 	} else {
 		if (build_rtpp_socks(0, 0))
 			return -1;
@@ -2189,7 +2464,7 @@ static void mod_destroy(void)
 	if(_rtpe_list_version!=NULL) {
 		shm_free(_rtpe_list_version);
 		_rtpe_list_version = NULL;
-	}
+	}	
 }
 
 
